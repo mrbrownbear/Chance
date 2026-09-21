@@ -282,6 +282,16 @@ jobs:
               if changed != text:
                   js.write_text(changed, "utf-8")
 
+          icons = ROOT / "icons"
+          icons.mkdir(parents=True, exist_ok=True)
+          favicon96 = icons / "favicon-96x96.png"
+          manifest192 = icons / "web-app-manifest-192x192.png"
+          if favicon96.exists():
+              shutil.copy2(favicon96, icons / "icon-16.png")
+              shutil.copy2(favicon96, icons / "icon-32.png")
+          if manifest192.exists():
+              shutil.copy2(manifest192, icons / "icon-192.png")
+
           required = [
               ROOT / "index.html",
               ROOT / "about" / "index.html",
