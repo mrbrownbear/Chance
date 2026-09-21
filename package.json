@@ -1,0 +1,12 @@
+{
+  "name": "ricardo-local",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.cjs",
+    "test": "node verify.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
