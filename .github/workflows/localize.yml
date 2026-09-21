@@ -1,0 +1,356 @@
+name: Localize Ricardo Chance
+
+on:
+  push:
+    paths:
+      - ".github/workflows/localize.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  localize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Capture public assets into the repository
+        shell: bash
+        run: |
+          cat > /tmp/localize.py <<'PY'
+          from __future__ import annotations
+          import html
+          import os
+          import re
+          import shutil
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from collections import deque
+          from pathlib import Path
+
+          BASE = "https://www.ricardochance.com"
+          ROOT = Path.cwd()
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+          ALLOWED_PREFIXES = (
+              "/_next/static/",
+              "/covers/",
+              "/videos/",
+              "/images/",
+              "/fonts/",
+              "/icons/",
+          )
+          SINGLE_FILES = {
+              "/favicon.ico",
+              "/favicon.svg",
+              "/site.webmanifest",
+          }
+
+          def request(url: str) -> bytes:
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": UA,
+                      "Accept": "*/*",
+                      "Referer": BASE + "/",
+                  },
+              )
+              last = None
+              for attempt in range(4):
+                  try:
+                      with urllib.request.urlopen(req, timeout=40) as response:
+                          return response.read()
+                  except Exception as exc:
+                      last = exc
+                      if attempt < 3:
+                          time.sleep(2 + attempt * 2)
+              raise last
+
+          def local_path(url_or_path: str) -> tuple[str, Path] | None:
+              absolute = urllib.parse.urljoin(BASE + "/", html.unescape(url_or_path))
+              parsed = urllib.parse.urlparse(absolute)
+              if parsed.netloc not in {"ricardochance.com", "www.ricardochance.com"}:
+                  return None
+              path = urllib.parse.unquote(parsed.path)
+              if path == "/_next/image":
+                  source = urllib.parse.parse_qs(parsed.query).get("url", [""])[0]
+                  if source.startswith("/") and not source.startswith("//"):
+                      return local_path(source)
+                  return None
+              if not (path.startswith(ALLOWED_PREFIXES) or path in SINGLE_FILES):
+                  return None
+              target = ROOT / path.lstrip("/")
+              return path, target
+
+          def discover(text: str) -> set[str]:
+              found = set()
+              decoded = html.unescape(text)
+
+              for match in re.finditer(r'''(?:src|href|poster)=["']([^"']+)["']''', decoded, re.I):
+                  found.add(match.group(1))
+              for match in re.finditer(r'''(?:srcset|imagesrcset)=["']([^"']+)["']''', decoded, re.I):
+                  for item in match.group(1).split(","):
+                      found.add(item.strip().split()[0])
+              for match in re.finditer(
+                  r'''["'](\/(?:_next\/static|covers|videos|images|fonts|icons)\/[^"'\\\s]+)["']''',
+                  decoded,
+              ):
+                  found.add(match.group(1))
+              for match in re.finditer(r'''url\(\s*["']?([^)"'\s]+)''', decoded, re.I):
+                  found.add(match.group(1))
+              return found
+
+          pages = {
+              "/": ROOT / "index.html",
+              "/about": ROOT / "about" / "index.html",
+              "/work": ROOT / "work" / "index.html",
+          }
+
+          queue = deque()
+          seen_urls = set()
+          downloaded = set()
+
+          for route, target in pages.items():
+              target.parent.mkdir(parents=True, exist_ok=True)
+              body = request(BASE + route)
+              target.write_bytes(body)
+              text = body.decode("utf-8", "ignore")
+              queue.extend(discover(text))
+
+          known_dynamic = [
+              "/covers/flixxo.png",
+              "/covers/nk.png",
+              "/covers/suku.png",
+              "/videos/flixxo.mp4",
+              "/videos/nk.mp4",
+              "/videos/suku.mp4",
+              "/images/assets/displacement.png",
+              "/images/assets/noise.png",
+              "/fonts/RedHatDisplay-BlackItalic.ttf",
+              "/icons/apple-touch-icon.png",
+              "/icons/favicon-96x96.png",
+              "/icons/web-app-manifest-192x192.png",
+              "/icons/web-app-manifest-512x512.png",
+              "/favicon.ico",
+              "/favicon.svg",
+              "/site.webmanifest",
+          ]
+          queue.extend(known_dynamic)
+
+          while queue:
+              item = queue.popleft()
+              normalized = local_path(item)
+              if not normalized:
+                  continue
+              path, target = normalized
+              if path in seen_urls:
+                  continue
+              seen_urls.add(path)
+              try:
+                  data = request(BASE + urllib.parse.quote(path, safe="/._~-"))
+              except Exception as exc:
+                  print(f"optional asset unavailable: {path}: {exc}")
+                  continue
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+              downloaded.add(path)
+              suffix = target.suffix.lower()
+              if suffix in {".js", ".css", ".html", ".json", ".webmanifest", ".svg"}:
+                  queue.extend(discover(data.decode("utf-8", "ignore")))
+
+          def rewrite_tag(match: re.Match[str]) -> str:
+              tag = match.group(0)
+
+              def replace_url(attr_match: re.Match[str]) -> str:
+                  key = attr_match.group(1)
+                  quote = attr_match.group(2)
+                  value = html.unescape(attr_match.group(3))
+                  absolute = urllib.parse.urljoin(BASE + "/", value)
+                  parsed = urllib.parse.urlparse(absolute)
+
+                  if parsed.netloc in {"ricardochance.com", "www.ricardochance.com"}:
+                      if parsed.path == "/_next/image":
+                          source = urllib.parse.parse_qs(parsed.query).get("url", [""])[0]
+                          if source.startswith("/") and not source.startswith("//"):
+                              value = source
+                      else:
+                          value = parsed.path
+                          if parsed.query:
+                              value += "?" + parsed.query
+                          if parsed.fragment:
+                              value += "#" + parsed.fragment
+
+                  if key.lower() == "href":
+                      clean = urllib.parse.urlparse(value).path.rstrip("/") or "/"
+                      routes = {
+                          "/en": "/",
+                          "/en/about": "/about/",
+                          "/en/work": "/work/",
+                          "/about": "/about/",
+                          "/work": "/work/",
+                          "/es": "/",
+                          "/es/about": "/about/",
+                          "/es/work": "/work/",
+                      }
+                      if clean in routes:
+                          value = routes[clean]
+
+                  return f"{key}={quote}{value}{quote}"
+
+              tag = re.sub(
+                  r'''(src|href|poster)=(["'])(.*?)\2''',
+                  replace_url,
+                  tag,
+                  flags=re.I,
+              )
+
+              def replace_srcset(attr_match: re.Match[str]) -> str:
+                  key, quote, value = attr_match.group(1), attr_match.group(2), html.unescape(attr_match.group(3))
+                  parts = []
+                  for item in value.split(","):
+                      bits = item.strip().split()
+                      if not bits:
+                          continue
+                      url = bits[0]
+                      parsed = urllib.parse.urlparse(urllib.parse.urljoin(BASE + "/", url))
+                      if parsed.path == "/_next/image":
+                          src = urllib.parse.parse_qs(parsed.query).get("url", [""])[0]
+                          if src.startswith("/") and not src.startswith("//"):
+                              url = src
+                      elif parsed.netloc in {"ricardochance.com", "www.ricardochance.com"}:
+                          url = parsed.path
+                      parts.append(" ".join([url] + bits[1:]))
+                  return f"{key}={quote}{', '.join(parts)}{quote}"
+
+              tag = re.sub(
+                  r'''(srcset|imagesrcset)=(["'])(.*?)\2''',
+                  replace_srcset,
+                  tag,
+                  flags=re.I,
+              )
+              return tag
+
+          csp = (
+              "<meta http-equiv=\"Content-Security-Policy\" "
+              "content=\"default-src 'self' data: blob:; "
+              "script-src 'self' 'unsafe-inline'; "
+              "style-src 'self' 'unsafe-inline'; "
+              "img-src 'self' data: blob:; "
+              "media-src 'self' blob:; "
+              "font-src 'self' data:; "
+              "connect-src 'self'; "
+              "worker-src 'self' blob:; frame-src 'none';\">"
+          )
+          runtime = '<script src="/local-runtime.js"></script>'
+
+          for target in pages.values():
+              text = target.read_text("utf-8")
+              text = re.sub(r"<(?:a|img|source|video|audio|link)\b[^>]*>", rewrite_tag, text, flags=re.I)
+              if "/local-runtime.js" not in text:
+                  text = text.replace("<head>", "<head>" + csp + runtime, 1)
+              target.write_text(text, "utf-8")
+
+          (ROOT / "en").mkdir(exist_ok=True)
+          shutil.copy2(ROOT / "index.html", ROOT / "en" / "index.html")
+          for name in ("about", "work"):
+              out = ROOT / "en" / name
+              out.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(ROOT / name / "index.html", out / "index.html")
+
+          for js in (ROOT / "_next" / "static" / "chunks").glob("*.js"):
+              try:
+                  text = js.read_text("utf-8")
+              except Exception:
+                  continue
+              changed = text
+              changed = changed.replace("unoptimized:!1", "unoptimized:!0")
+              if "createServerReference" in changed and "form.services.options" in changed:
+                  changed = re.sub(
+                      r'''let m=(?:async\s+)?[^,;]+(?=,f=/\^\[\^\\s@\])''',
+                      "let m=async data=>window.localSite.prepareContact(data)",
+                      changed,
+                      count=1,
+                  )
+              if changed != text:
+                  js.write_text(changed, "utf-8")
+
+          required = [
+              ROOT / "index.html",
+              ROOT / "about" / "index.html",
+              ROOT / "work" / "index.html",
+              ROOT / "local-runtime.js",
+          ]
+          for file in required:
+              if not file.is_file() or file.stat().st_size < 100:
+                  raise SystemExit(f"required local file missing: {file}")
+
+          print(f"localized pages: {len(pages) * 2}")
+          print(f"localized fetched assets: {len(downloaded)}")
+          PY
+
+          python /tmp/localize.py
+
+      - name: Verify local references
+        shell: bash
+        run: |
+          python - <<'PY'
+          import html
+          import re
+          import urllib.parse
+          from pathlib import Path
+
+          root = Path.cwd()
+          errors = []
+          pages = [
+              root / "index.html",
+              root / "about/index.html",
+              root / "work/index.html",
+              root / "en/index.html",
+              root / "en/about/index.html",
+              root / "en/work/index.html",
+          ]
+
+          for page in pages:
+              text = page.read_text("utf-8")
+              if "<body" not in text:
+                  errors.append(f"invalid page: {page}")
+              for tag in re.findall(r"<(?:script|img|source|video|audio|link)\b[^>]*>", text, re.I):
+                  for raw in re.findall(r'''(?:src|href|poster)=["']([^"']+)["']''', tag, re.I):
+                      raw = html.unescape(raw)
+                      if raw.startswith(("data:", "blob:", "mailto:", "#")):
+                          continue
+                      parsed = urllib.parse.urlparse(raw)
+                      if parsed.scheme in {"http", "https"}:
+                          errors.append(f"remote automatic resource: {raw}")
+                          continue
+                      if parsed.path.startswith("/") and parsed.path not in {"/", "/about/", "/work/"}:
+                          local = root / urllib.parse.unquote(parsed.path.lstrip("/"))
+                          if not local.exists():
+                              errors.append(f"missing local resource: {parsed.path}")
+
+          if errors:
+              print("\n".join(errors[:100]))
+              raise SystemExit(1)
+          print("Local page and automatic asset reference checks passed.")
+          PY
+
+      - name: Commit localized site
+        shell: bash
+        run: |
+          rm -f .github/workflows/localize.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git config user.name "Brown"
+          git config user.email "108557031+mrbrownbear@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Add fully localized Ricardo Chance site"
+          git push origin HEAD:main
